@@ -18,10 +18,34 @@
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
 │   ├── app/services/base.py     共享服务骨架
+│   ├── app/services/export_store.py  导出文件组的一致性发布与恢复
 │   └── app/store.py          内存数据仓库与示例数据
 ├── .gitignore
 └── docker-compose.yml
 ```
+
+## 导出文件组的发布一致性
+
+同一条导出任务可以反复执行。每次执行都会发布一个**不可变版本**到
+`data/exports/<任务号>/publications/<发布编号>/`，里面同时包含
+`export.json`、`export.csv` 和 `manifest.json`；`current.json` 指针最后才原子切换。
+
+- 写入先落在 `data/exports/.staging/`，重新读取核对列、行、值摘要和文件摘要后，
+  整个目录才 `os.replace` 到发布目录。写了一半的文件组永远不会替换可用版本。
+- 指针缺失、损坏或发布中断时，读取侧从完整的历史发布中恢复最新一版，
+  恢复记录带上 `source: recovered`；暂存半成品不会被提升。
+- 下载、归并都通过同一个发布凭据取数：下载响应头带
+  `X-Export-Publication`/`X-Export-Digest`，归并返回 `receipt.sources[*]`
+  含发布编号、内容摘要和可下载地址，归并行与下载成果可逐值核对。
+- 发布中断期间，下载与归并继续读上一版完整文件组；恢复后两者同时切换。
+
+相关接口：
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /api/export_task/{id}/publications` | 列出所有发布版本，标明当前生效与完整性 |
+| `GET /api/export_task/{id}/download?publication_id=&format=csv|json` | 下载指定/当前发布 |
+| `GET /api/data_merge/{id}/merge?publication_id=` | 从发布归并取数，返回行与发布凭据 |
 
 ## 启动
 

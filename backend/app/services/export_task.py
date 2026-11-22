@@ -10,7 +10,8 @@
 - 消费 field_mask 快照 -> 导出数据应用脱敏规则
 - 消费 result_format 快照 -> 导出数据按模板格式化
 - 写入 data/exports/ 共享目录 -> call_audit 消费导出审计
-- 被 data_merge 消费 -> 多源导出归并
+- 被 data_merge 消费 -> 从同一发布凭据归并
+- 每次执行发布一个不可变文件组（JSON/CSV/清单），重跑不覆盖可用版本
 """
 from __future__ import annotations
 
@@ -30,8 +31,19 @@ class ExportTaskService(BaseModuleService):
     ACTION_RULES = {"发起导出": "导出中", "确认完成": "已完成", "标记失败": "已失败"}
     NEGATIVE_ACTIONS = []
 
-    def execute_export(self, export_id: int) -> dict[str, Any]:
-        """执行导出任务：查询数据 → 过滤 → 脱敏 → 格式化 → 写入文件。"""
+    def execute_export(
+        self,
+        export_id: int,
+        *,
+        failpoint: str | None = None,
+        stage_hook=None,
+    ) -> dict[str, Any]:
+        """执行导出任务：查询数据 → 过滤 → 脱敏 → 格式化 → 发布文件组。
+
+        每次执行都会发布一个新的不可变版本；只有整个文件组落盘并核对通过后，
+        ``current`` 指针才会切换，所以重跑中断不会污染上一版可用文件。
+        ``failpoint``/``stage_hook`` 仅供故障注入验证使用。
+        """
         entry = store.find(self.MODULE, export_id)
         if entry is None:
             return {"ok": False, "message": "任务不存在"}
@@ -55,8 +67,9 @@ class ExportTaskService(BaseModuleService):
         if mask_svc and hasattr(mask_svc, "mask_fields"):
             source_rows = mask_svc.mask_fields(api_name, source_rows)
 
-        # 写入导出文件
+        # 写入导出文件组
         from app.services.data_manager import write_export
+        from app.services.export_store import PublicationError
         columns = list(source_rows[0].keys()) if source_rows else []
         export_data = {
             "export_id": export_id,
@@ -69,9 +82,15 @@ class ExportTaskService(BaseModuleService):
             "rows": [[str(r.get(c, "")) for c in columns] for r in source_rows],
             "status": "已完成",
         }
-        write_export(export_id, export_data)
+        try:
+            credential = write_export(
+                export_id, export_data, failpoint=failpoint, stage_hook=stage_hook
+            )
+        except PublicationError as exc:
+            # 发布失败时保留上一版发布与 current 指针，任务不标记完成。
+            return {"ok": False, "message": f"导出发布失败：{exc}"}
 
-        # 写审计记录
+        # 写审计记录：记录本次发布凭据，便于事后核对归并/下载取的是哪一次取数。
         from app.services.data_manager import write_audit
         audit_id = self._next_audit_id()
         write_audit(audit_id, {
@@ -81,11 +100,18 @@ class ExportTaskService(BaseModuleService):
             "event": "export_completed",
             "export_id": export_id,
             "rows_count": len(source_rows),
+            "publication_id": credential["publication_id"],
+            "publication_digest": credential["digest"],
         })
 
         entry["status"] = "已完成"
         entry["数据行数"] = str(len(source_rows))
-        return {"ok": True, "export_id": export_id, "rows_count": len(source_rows)}
+        return {
+            "ok": True,
+            "export_id": export_id,
+            "rows_count": len(source_rows),
+            **credential,
+        }
 
     def _mock_query(self, api_name: str) -> list[dict[str, Any]]:
         """模拟从数据源查询结果。"""

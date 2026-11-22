@@ -5,7 +5,7 @@
 - 下游服务从 data/ 目录读取上游的标准化数据产物
 - 审计记录写入 data/audit/
 - 用量记录写入 data/usage/
-- 导出任务结果写入 data/exports/
+- 导出任务结果以不可变发布版本写入 data/exports/（见 export_store）
 - API 注册快照写入 data/api/
 - 订阅审批记录写入 data/subscriptions/
 """
@@ -221,38 +221,45 @@ def archive_audit_records(before_date: str) -> dict[str, Any]:
 # ========== 导出任务 ==========
 
 
-def write_export(export_id: int, export_data: dict[str, Any]) -> None:
-    """写入导出任务结果。"""
-    export_data["_created_at"] = export_data.get("_created_at", _now_iso())
-    export_data["_updated_at"] = _now_iso()
-    _write_json(DATA_ROOT / "exports" / f"{export_id:06d}.json", export_data)
-    # 同时生成一份导出 CSV
-    _write_export_csv(export_id, export_data)
+def write_export(
+    export_id: int,
+    export_data: dict[str, Any],
+    *,
+    failpoint: str | None = None,
+    stage_hook=None,
+) -> dict[str, Any]:
+    """把一次导出发布成不可变的文件组，返回发布凭据。
 
+    同一任务重跑不会就地覆盖 JSON/CSV：每次执行都会生成新的发布版本，
+    读者要么看到旧的完整版本，要么看到新的完整版本。
+    """
+    from app.services import export_store
 
-def _write_export_csv(export_id: int, export_data: dict[str, Any]) -> None:
-    """根据导出数据生成 CSV 文件头。"""
-    columns = export_data.get("columns", [])
-    rows = export_data.get("rows", [])
-    csv_path = DATA_ROOT / "exports" / f"{export_id:06d}.csv"
-    lines = [",".join(columns)]
-    for row in rows:
-        lines.append(",".join(str(v) for v in row))
-    csv_path.write_text("\n".join(lines), encoding="utf-8")
+    return export_store.publish_export(
+        export_id, export_data, failpoint=failpoint, stage_hook=stage_hook
+    )
 
 
 def read_export(export_id: int) -> dict[str, Any]:
-    return _read_json(DATA_ROOT / "exports" / f"{export_id:06d}.json", {})
+    """读取导出任务当前生效的发布内容；没有发布时返回空字典。"""
+    from app.services import export_store
+
+    payload = export_store.read_current_payload(export_id)
+    return payload or {}
 
 
 def list_exports() -> list[dict[str, Any]]:
-    _ensure_dir(DATA_ROOT / "exports")
-    records = []
-    for f in sorted(DATA_ROOT.glob("exports/[0-9]*.json")):
-        record = _read_json(f)
-        if record:
-            records.append(record)
-    return records
+    """列出每个导出任务当前生效的发布内容（每任务至多一条）。"""
+    from app.services import export_store
+
+    exports = []
+    for record in export_store.list_current_exports():
+        payload = dict(record["payload"])
+        payload["_publication_id"] = record["publication_id"]
+        payload["_publication_digest"] = record["digest"]
+        payload["_published_at"] = record.get("published_at")
+        exports.append(payload)
+    return exports
 
 
 # ========== 模块数据快照 ==========

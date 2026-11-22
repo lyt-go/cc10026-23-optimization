@@ -14,6 +14,17 @@ from app.services.base import BaseModuleService
 from app.store import store
 
 
+class MergeResult(list):
+    """归并结果行，同时携带本次取数的发布凭据。
+
+    保持 ``list`` 语义以兼容既有调用方，同时提供 ``receipt`` / ``publications``
+    方便调用方核对归并结果与可下载成果来自同一次发布。
+    """
+
+    receipt: dict[str, Any] = {}
+    publications: list[dict[str, Any]] = []
+
+
 class DataMergeService(BaseModuleService):
     MODULE = "data_merge"
     ENTITY = "归并规则"
@@ -97,29 +108,165 @@ class DataMergeService(BaseModuleService):
         })
         return merged
 
-    def merge_from_exports(self, rule_id: int) -> list[dict[str, Any]]:
-        """从导出产物直接读取两个数据源并进行归并。
+    def merge_publications(
+        self,
+        rule_id: int,
+        publication_ids: list[str] | None = None,
+        *,
+        verify: bool = True,
+    ) -> dict[str, Any]:
+        """从导出发布取数并归并，返回行和发布凭据。
 
-        跨模块增强：被 export_task 完成后调用，实现导出->归并->审计链路。
+        - 指定 ``publication_ids`` 时严格读取这些发布版本，损坏直接报错；
+        - 未指定时取每个导出任务当前生效的发布，按发布时间倒序取前两个；
+        - 所有来源都来自同一套 ``export_store`` 读取路径，和文件下载共用凭据，
+          因此归并返回行与下载成果可以逐值核对。
         """
-        from app.services.data_manager import list_exports
-        exports = list_exports()
-        exports.sort(key=lambda x: x.get("_created_at", ""), reverse=True)
-        source_a = exports[0] if len(exports) > 0 else {}
-        source_b = exports[1] if len(exports) > 1 else {}
+        from app.services import export_store
 
-        rows_a = []
-        rows_b = []
-        cols_a = source_a.get("columns", [])
-        cols_b = source_b.get("columns", [])
-        for row_vals in source_a.get("rows", []):
-            row = {col: val for col, val in zip(cols_a, row_vals)} if cols_a else {}
-            rows_a.append(row)
-        for row_vals in source_b.get("rows", []):
-            row = {col: val for col, val in zip(cols_b, row_vals)} if cols_b else {}
-            rows_b.append(row)
+        records: list[dict[str, Any]] = []
+        if publication_ids:
+            for publication_id in publication_ids:
+                record = export_store.find_publication(
+                    str(publication_id), verify=verify
+                )
+                if record is None:
+                    raise export_store.PublicationNotFound(
+                        f"发布版本 {publication_id} 不存在"
+                    )
+                records.append(record)
+        else:
+            records = export_store.list_current_exports(verify=verify)
+            records.sort(
+                key=lambda item: str(item.get("published_at") or ""), reverse=True
+            )
 
-        return self.merge_and_audit(rule_id, rows_a, rows_b)
+        source_a = records[0] if len(records) > 0 else None
+        source_b = records[1] if len(records) > 1 else None
+
+        def _rows(record: dict[str, Any] | None) -> list[dict[str, Any]]:
+            if record is None:
+                return []
+            columns = record.get("columns") or []
+            return [
+                {column: value for column, value in zip(columns, row)}
+                for row in record.get("rows", [])
+            ]
+
+        rows_a = _rows(source_a)
+        rows_b = _rows(source_b)
+        merged = self.merge_sources(rule_id, rows_a, rows_b)
+
+        rule = store.find(self.MODULE, rule_id)
+        sources = [
+            self._source_receipt(record)
+            for record in (source_a, source_b)
+            if record is not None
+        ]
+        receipt = {
+            "rule_id": rule_id,
+            "rule_no": rule.get("规则编号", "") if rule else "",
+            "sources": sources,
+            "merged_count": len(merged),
+            "rows_digest": self._rows_digest(merged),
+            "generated_at": self._now_iso(),
+        }
+
+        # 审计里固定写入本次取数的发布编号与摘要，恢复期间也能追踪来源。
+        from app.services.data_manager import write_audit, DATA_ROOT
+        audit_id = max((int(f.stem) for f in DATA_ROOT.glob("audit/[0-9]*.json")), default=0) + 1
+        write_audit(audit_id, {
+            "audit_id": audit_id,
+            "api_name": rule.get("主API", "") if rule else "",
+            "caller": "data_merge",
+            "event": "merge_completed",
+            "primary_count": len(rows_a),
+            "secondary_count": len(rows_b),
+            "merged_count": len(merged),
+            "rule_no": rule.get("规则编号", "") if rule else "",
+            "publications": [
+                {
+                    "export_id": item["export_id"],
+                    "publication_id": item["publication_id"],
+                    "digest": item["digest"],
+                    "source": item.get("source"),
+                }
+                for item in sources
+            ],
+            "merged_digest": receipt["rows_digest"],
+        })
+        return {"rows": merged, "receipt": receipt}
+
+    @staticmethod
+    def _source_receipt(record: dict[str, Any]) -> dict[str, Any]:
+        from app.services import export_store
+
+        return {
+            "export_id": record["export_id"],
+            "publication_id": record["publication_id"],
+            "digest": record["digest"],
+            "data_digest": record.get("data_digest", record["digest"]),
+            "published_at": record.get("published_at"),
+            "source": record.get("source"),
+            "row_count": record.get("row_count", len(record.get("rows", []))),
+            "columns": list(record.get("columns") or []),
+            "rows_digest": export_store._data_digest(
+                list(record.get("columns") or []),
+                [
+                    [str(value) for value in row]
+                    for row in record.get("rows", [])
+                ],
+            ),
+            "download": {
+                "csv": (
+                    f"/api/export_task/{record['export_id']}/download"
+                    f"?publication_id={record['publication_id']}&format=csv"
+                ),
+                "json": (
+                    f"/api/export_task/{record['export_id']}/download"
+                    f"?publication_id={record['publication_id']}&format=json"
+                ),
+            },
+        }
+
+    @staticmethod
+    def _rows_digest(rows: list[dict[str, Any]]) -> str:
+        from app.services import export_store
+
+        columns: list[str] = []
+        for row in rows:
+            for key in row.keys():
+                text = str(key)
+                if text not in columns:
+                    columns.append(text)
+        values = [[str(row.get(column, "")) for column in columns] for row in rows]
+        return export_store._data_digest(columns, values)
+
+    @staticmethod
+    def _now_iso() -> str:
+        from app.services.data_manager import _now_iso
+
+        return _now_iso()
+
+    def merge_from_exports(
+        self,
+        rule_id: int,
+        publication_ids: list[str] | None = None,
+        *,
+        verify: bool = True,
+    ) -> list[dict[str, Any]]:
+        """从导出发布直接读取两个数据源并进行归并。
+
+        返回行为普通列表，同时通过 ``MergeResult`` 暴露本次取数的发布凭据
+        （``.receipt`` / ``.sources``），便于调用方和下载结果对账。
+        """
+        result = self.merge_publications(
+            rule_id, publication_ids, verify=verify
+        )
+        merged = MergeResult(result["rows"])
+        merged.receipt = result["receipt"]
+        merged.publications = result["receipt"]["sources"]
+        return merged
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(self.MODULE, entry_id)
